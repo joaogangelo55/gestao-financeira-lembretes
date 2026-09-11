@@ -1,20 +1,23 @@
+import { Alert } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, Text, View } from 'react-native';
+
+import HomeScreen from './src/screens/HomeScreen';
 
 export default function App() {
+  function handleOpenFinances() {
+    Alert.alert(
+      'Módulo Financeiro',
+      'A tela de finanças será conectada no próximo passo.'
+    );
+  }
+
   return (
-    <View style={styles.container}>
-      <Text>Open up App.js to start working on your app!</Text>
-      <StatusBar style="auto" />
-    </View>
+    <>
+      <StatusBar style="dark" />
+
+      <HomeScreen
+        onOpenFinances={handleOpenFinances}
+      />
+    </>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
