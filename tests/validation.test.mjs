@@ -13,10 +13,17 @@ test('validateLogin exige nome, e-mail válido e senha mínima', () => {
   assert.equal(validateLogin({ name: 'Ana', email: 'ana@exemplo.com', password: '123456' }).valid, true);
 });
 
-test('validateLogin normaliza nome e e-mail', () => {
+test('validateLogin permite entrar sem repetir o nome', () => {
+  assert.deepEqual(
+    validateLogin({ name: '', email: 'ana@exemplo.com', password: '123456' }, { requireName: false }),
+    { valid: true, value: { name: '', email: 'ana@exemplo.com', password: '123456' } }
+  );
+});
+
+test('validateLogin normaliza nome, e-mail e mantém senha apenas para autenticação', () => {
   assert.deepEqual(validateLogin({ name: '  Ana Silva ', email: ' ANA@EXEMPLO.COM ', password: '123456' }), {
     valid: true,
-    value: { name: 'Ana Silva', email: 'ana@exemplo.com' },
+    value: { name: 'Ana Silva', email: 'ana@exemplo.com', password: '123456' },
   });
 });
 

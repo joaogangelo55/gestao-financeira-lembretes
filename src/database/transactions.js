@@ -59,6 +59,7 @@ export async function getUserSession() {
 export async function saveUserSession(user) {
   const db = await getDatabase();
   await db.runAsync('INSERT OR REPLACE INTO user_session (id, name, email, avatar_uri) VALUES (1, ?, ?, ?)', [user.name, user.email, user.avatarUri ?? null]);
+  return { name: user.name, email: user.email, avatarUri: user.avatarUri ?? null };
 }
 
 export async function updateUserProfile(profile) {

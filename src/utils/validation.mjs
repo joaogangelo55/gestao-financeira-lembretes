@@ -1,15 +1,17 @@
 import { brDateToIso, isValidIsoDate } from './dates.mjs';
 
-export function validateLogin(credentials) {
+export function validateLogin(credentials, { requireName = true } = {}) {
   const name = String(credentials.name ?? '').trim();
   const email = String(credentials.email ?? '').trim().toLowerCase();
   const password = String(credentials.password ?? '');
 
-  if (name.length < 2) return { valid: false, error: 'Informe seu nome.' };
+  if (requireName && name.length < 2) return { valid: false, error: 'Informe seu nome.' };
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { valid: false, error: 'Informe um e-mail válido.' };
   if (password.length < 6) return { valid: false, error: 'A senha deve ter pelo menos 6 caracteres.' };
 
-  return { valid: true, value: { name, email } };
+  // A senha só existe no objeto retornado durante este fluxo. As camadas de
+  // persistência local e remota usam-na para autenticar e nunca a gravam.
+  return { valid: true, value: { name, email, password } };
 }
 
 export function normalizeCurrency(input) {
