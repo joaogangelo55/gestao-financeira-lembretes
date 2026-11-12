@@ -107,8 +107,9 @@ export async function saveTransaction(transaction, id = null) {
 }
 
 export async function deleteTransaction(id) {
-  const { error } = await getSupabase().from('transactions').delete().eq('id', id);
+  const { data, error } = await getSupabase().from('transactions').delete().eq('id', id).select('id');
   throwIfError(error);
+  if (!data?.length) throw new Error('A transação não foi excluída. Confira sua sessão e tente novamente.');
 }
 
 export async function changeTransactionStatus(id, status) {
@@ -118,7 +119,14 @@ export async function changeTransactionStatus(id, status) {
 
 export async function getMonthlySummary() {
   const month = getLocalTodayIso().slice(0, 7);
-  const { data, error } = await getSupabase().from('transactions').select('type, amount, status').like('due_date', `${month}-%`);
+  const startDate = `${month}-01`;
+  const nextMonthStart = new Date(`${startDate}T00:00:00Z`);
+  nextMonthStart.setUTCMonth(nextMonthStart.getUTCMonth() + 1);
+  // due_date é do tipo DATE no PostgreSQL, não texto (LIKE não se aplica).
+  const { data, error } = await getSupabase().from('transactions')
+    .select('type, amount, status')
+    .gte('due_date', startDate)
+    .lt('due_date', nextMonthStart.toISOString().slice(0, 10));
   throwIfError(error);
   return (data ?? []).reduce((summary, item) => ({
     receitas: summary.receitas + (item.type === 'receita' ? Number(item.amount) : 0),
@@ -154,7 +162,8 @@ export async function deleteReminder(id) {
   const supabase = getSupabase();
   const { data, error } = await supabase.from('reminders').select('notification_id').eq('id', id).single();
   throwIfError(error);
-  const { error: deleteError } = await supabase.from('reminders').delete().eq('id', id);
+  const { data: deleted, error: deleteError } = await supabase.from('reminders').delete().eq('id', id).select('id');
   throwIfError(deleteError);
+  if (!deleted?.length) throw new Error('O lembrete não foi excluído. Confira sua sessão e tente novamente.');
   return data?.notification_id ?? null;
 }

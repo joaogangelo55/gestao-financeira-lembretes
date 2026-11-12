@@ -1,0 +1,44 @@
+--- a/App.js
++++ b/App.js
+@@ -24,0 +25,20 @@
++}
++
++// Usa confirmação nativa no celular e window.confirm no navegador.
++function confirmAction(title, message, confirmLabel, onConfirm) {
++  const execute = async () => {
++    try {
++      await onConfirm();
++    } catch (cause) {
++      console.error('Falha na ação confirmada', cause);
++      showFeedback('Não foi possível concluir', cause?.message || 'Tente novamente.');
++    }
++  };
++  if (Platform.OS === 'web' && typeof window !== 'undefined') {
++    if (window.confirm(`${title}\n\n${message}`)) void execute();
++    return;
++  }
++  Alert.alert(title, message, [
++    { text: 'Cancelar', style: 'cancel' },
++    { text: confirmLabel, style: 'destructive', onPress: () => { void execute(); } },
++  ]);
+@@ -117 +137 @@
+-      {tab === 'finanças' && <Finance transactions={transactions} filter={filter} setFilter={setFilter} onAdd={() => setTransactionForm(newTransaction())} onEdit={(item) => setTransactionForm({ ...item, dueDate: isoToBrDate(item.due_date) })} onDelete={(item) => Alert.alert('Excluir transação?', item.description, [{ text: 'Cancelar' }, { text: 'Excluir', style: 'destructive', onPress: async () => { await deleteTransaction(item.id); refresh(); } }])} onStatus={async (item) => { await changeTransactionStatus(item.id, item.status === 'pendente' ? 'concluida' : 'pendente'); refresh(); }} />}
++      {tab === 'finanças' && <Finance transactions={transactions} filter={filter} setFilter={setFilter} onAdd={() => setTransactionForm(newTransaction())} onEdit={(item) => setTransactionForm({ ...item, dueDate: isoToBrDate(item.due_date) })} onDelete={(item) => confirmAction('Excluir transação?', `${item.description}\nEsta ação não pode ser desfeita.`, 'Excluir', async () => { await deleteTransaction(item.id); await refresh(); })} onStatus={async (item) => { await changeTransactionStatus(item.id, item.status === 'pendente' ? 'concluida' : 'pendente'); refresh(); }} />}
+@@ -118 +138 @@
+-      {tab === 'lembretes' && <Reminders reminders={reminders} onAdd={() => setReminderForm(newReminder())} onEdit={(item) => setReminderForm({ ...item, reminderDate: isoToBrDate(item.reminder_date), reminderTime: item.reminder_time, transactionId: item.transaction_id, notificationId: item.notification_id })} onDelete={(item) => Alert.alert('Excluir lembrete?', item.title, [{ text: 'Cancelar' }, { text: 'Excluir', style: 'destructive', onPress: async () => { const id = await deleteReminder(item.id); await cancelReminder(id); refresh(); } }])} />}
++      {tab === 'lembretes' && <Reminders reminders={reminders} onAdd={() => setReminderForm(newReminder())} onEdit={(item) => setReminderForm({ ...item, reminderDate: isoToBrDate(item.reminder_date), reminderTime: item.reminder_time, transactionId: item.transaction_id, notificationId: item.notification_id })} onDelete={(item) => confirmAction('Excluir lembrete?', `${item.title}\nEsta ação não pode ser desfeita.`, 'Excluir', async () => { const id = await deleteReminder(item.id); await cancelReminder(id); await refresh(); })} />}
+@@ -135 +155 @@
+-function Settings({ user, onProfile, onOnboarding, onLogout }) { const [notice, setNotice] = useState(''); return <ScrollView contentContainerStyle={styles.scroll}><Text style={styles.heading}>Ajustes</Text><Text style={styles.section}>Meu perfil</Text><Pressable style={styles.setting} onPress={onProfile}><Avatar name={user.name} uri={user.avatarUri}/><View><Text style={styles.rowTitle}>{user.name}</Text><Text style={styles.muted}>{user.email}</Text></View><Text style={styles.link}>Editar</Text></Pressable><Text style={styles.section}>Notificações</Text><Button title="Verificar e solicitar permissão" onPress={async () => { const granted = await prepareNotifications(); setNotice(granted ? 'Notificações locais permitidas neste aparelho.' : 'Permissão não concedida. Ative nas configurações do sistema se desejar receber avisos.'); }} variant="secondary"/><Text style={styles.muted}>{notice}</Text><Text style={styles.section}>Preferências regionais</Text><View style={styles.card}><Text>Idioma: Português (Brasil)</Text><Text>Moeda: Real brasileiro (BRL)</Text><Text>Datas: DD/MM/AAAA</Text></View><Text style={styles.section}>Introdução</Text><Button title="Ver apresentação novamente" onPress={onOnboarding} variant="secondary"/><Text style={styles.section}>Sobre e privacidade</Text><View style={styles.card}><Text style={styles.rowTitle}>Meu Financeiro · versão 1.0.0</Text><Text style={styles.muted}>Projeto acadêmico. Dados, fotos e movimentações ficam neste aparelho; não há sincronização em nuvem, conta bancária real ou autenticação de servidor.</Text></View><Button title="Sair da sessão" onPress={() => Alert.alert('Sair da sessão?', 'As movimentações permanecem neste aparelho.', [{ text: 'Cancelar' }, { text: 'Sair', style: 'destructive', onPress: onLogout }])} variant="danger"/></ScrollView>; }
++function Settings({ user, onProfile, onOnboarding, onLogout }) { const [notice, setNotice] = useState(''); return <ScrollView contentContainerStyle={styles.scroll}><Text style={styles.heading}>Ajustes</Text><Text style={styles.section}>Meu perfil</Text><Pressable style={styles.setting} onPress={onProfile}><Avatar name={user.name} uri={user.avatarUri}/><View><Text style={styles.rowTitle}>{user.name}</Text><Text style={styles.muted}>{user.email}</Text></View><Text style={styles.link}>Editar</Text></Pressable><Text style={styles.section}>Notificações</Text><Button title="Verificar e solicitar permissão" onPress={async () => { const granted = await prepareNotifications(); setNotice(granted ? 'Notificações locais permitidas neste aparelho.' : 'Permissão não concedida. Ative nas configurações do sistema se desejar receber avisos.'); }} variant="secondary"/><Text style={styles.muted}>{notice}</Text><Text style={styles.section}>Preferências regionais</Text><View style={styles.card}><Text>Idioma: Português (Brasil)</Text><Text>Moeda: Real brasileiro (BRL)</Text><Text>Datas: DD/MM/AAAA</Text></View><Text style={styles.section}>Introdução</Text><Button title="Ver apresentação novamente" onPress={onOnboarding} variant="secondary"/><Text style={styles.section}>Sobre e privacidade</Text><View style={styles.card}><Text style={styles.rowTitle}>Meu Financeiro · versão 1.0.0</Text><Text style={styles.muted}>Projeto acadêmico. Dados, fotos e movimentações ficam neste aparelho; não há sincronização em nuvem, conta bancária real ou autenticação de servidor.</Text></View><Button title="Sair da sessão" onPress={() => confirmAction('Sair da sessão?', Platform.OS === 'web' ? 'Seus dados permanecerão salvos na nuvem.' : 'As movimentações permanecem neste aparelho.', 'Sair', onLogout)} variant="danger"/></ScrollView>; }
+--- a/src/database/transactions.web.js
++++ b/src/database/transactions.web.js
+@@ -110 +110 @@
+-  const { error } = await getSupabase().from('transactions').delete().eq('id', id);
++  const { data, error } = await getSupabase().from('transactions').delete().eq('id', id).select('id');
+@@ -111,0 +112 @@
++  if (!data?.length) throw new Error('A transação não foi excluída. Confira sua sessão e tente novamente.');
+@@ -164 +165 @@
+-  const { error: deleteError } = await supabase.from('reminders').delete().eq('id', id);
++  const { data: deleted, error: deleteError } = await supabase.from('reminders').delete().eq('id', id).select('id');
+@@ -165,0 +167 @@
++  if (!deleted?.length) throw new Error('O lembrete não foi excluído. Confira sua sessão e tente novamente.');
