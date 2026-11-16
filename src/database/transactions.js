@@ -1,152 +1,217 @@
-import * as SQLite from 'expo-sqlite';
+import { Platform } from 'react-native';
+import * as ExpoLinking from 'expo-linking';
+import { createAuthRedirectUrl } from '../services/authRedirect.mjs';
 import { getLocalTodayIso } from '../utils/dates.mjs';
+import { getSupabase } from '../services/supabaseClient';
 
-let databasePromise;
-
-async function getDatabase() {
-  if (!databasePromise) databasePromise = SQLite.openDatabaseAsync('financeiro.db');
-  return databasePromise;
+function preferences() {
+  if (typeof localStorage === 'undefined') return null;
+  return localStorage;
 }
 
-export async function initDatabase() {
-  const db = await getDatabase();
-  await db.execAsync(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
-    CREATE TABLE IF NOT EXISTS transactions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      type TEXT NOT NULL CHECK(type IN ('receita', 'despesa')),
-      description TEXT NOT NULL,
-      amount REAL NOT NULL,
-      category TEXT NOT NULL,
-      due_date TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pendente' CHECK(status IN ('pendente', 'concluida')),
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS user_session (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      name TEXT NOT NULL,
-      email TEXT NOT NULL,
-      avatar_uri TEXT
-    );
-    CREATE TABLE IF NOT EXISTS app_preferences (
-      key TEXT PRIMARY KEY NOT NULL,
-      value TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS reminders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      notes TEXT NOT NULL DEFAULT '',
-      reminder_date TEXT NOT NULL,
-      reminder_time TEXT NOT NULL,
-      transaction_id INTEGER,
-      notification_id TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE SET NULL
-    );
-  `);
-  const userColumns = await db.getAllAsync('PRAGMA table_info(user_session)');
-  if (!userColumns.some((column) => column.name === 'avatar_uri')) {
-    await db.execAsync('ALTER TABLE user_session ADD COLUMN avatar_uri TEXT');
+function throwIfError(error) {
+  if (error) throw new Error(error.message);
+}
+
+async function currentUser() {
+  const { data, error } = await getSupabase().auth.getUser();
+  throwIfError(error);
+  if (!data.user) throw new Error('Sua sessão expirou. Entre novamente.');
+  return data.user;
+}
+
+async function profileFromUser(user) {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('name, email, avatar_uri')
+    .eq('id', user.id)
+    .maybeSingle();
+  throwIfError(error);
+
+  if (data) {
+    // Sincroniza cópia de email do perfil após a confirmação oficial no Auth.
+    if (user.email && data.email !== user.email) {
+      void supabase.from('profiles').update({ email: user.email }).eq('id', user.id)
+        .then(({ error }) => { if (error) console.warn('Não foi possível sincronizar o e-mail de perfil.'); })
+        .catch(() => { /* sincronização será tentada no próximo login */ });
+    }
+    return { name: data.name, email: user.email, avatarUri: data.avatar_uri };
   }
+
+  const fallback = {
+    id: user.id,
+    name: user.user_metadata?.name || user.email?.split('@')[0] || 'Usuário',
+    email: user.email,
+  };
+  const { error: insertError } = await supabase.from('profiles').upsert(fallback);
+  throwIfError(insertError);
+  return { name: fallback.name, email: fallback.email, avatarUri: null };
+}
+
+// O SQLite legado continua intacto no dispositivo. Esta versão não lê nem associa
+// automaticamente seus registros a uma conta para impedir transferência indevida.
+export async function initDatabase() {
+  getSupabase();
 }
 
 export async function getUserSession() {
-  const db = await getDatabase();
-  return db.getFirstAsync('SELECT name, email, avatar_uri AS avatarUri FROM user_session WHERE id = 1');
+  const { data, error } = await getSupabase().auth.getSession();
+  throwIfError(error);
+  return data.session ? profileFromUser(data.session.user) : null;
 }
 
-export async function saveUserSession(user) {
-  const db = await getDatabase();
-  await db.runAsync('INSERT OR REPLACE INTO user_session (id, name, email, avatar_uri) VALUES (1, ?, ?, ?)', [user.name, user.email, user.avatarUri ?? null]);
-  return { name: user.name, email: user.email, avatarUri: user.avatarUri ?? null };
+export async function saveUserSession(credentials, mode = 'signin') {
+  const supabase = getSupabase();
+  const { name, email, password } = credentials;
+  const response = mode === 'signup'
+    ? await supabase.auth.signUp({ email, password, options: { data: { name } } })
+    : await supabase.auth.signInWithPassword({ email, password });
+  throwIfError(response.error);
+  if (!response.data.session) {
+    throw new Error('Confira seu e-mail para confirmar a conta e depois entre com sua senha.');
+  }
+  return profileFromUser(response.data.user);
 }
 
 export async function updateUserProfile(profile) {
-  const db = await getDatabase();
-  await db.runAsync('UPDATE user_session SET name = ?, email = ?, avatar_uri = ? WHERE id = 1', [profile.name, profile.email, profile.avatarUri ?? null]);
+  const supabase = getSupabase();
+  const user = await currentUser();
+  const requestedEmail = String(profile.email || '').trim().toLowerCase();
+  const currentEmail = String(user.email || '').trim().toLowerCase();
+  if (!/^\S+@\S+\.\S+$/.test(requestedEmail)) throw new Error('E-mail inválido.');
+
+  // O e-mail exibido continua vindo de Supabase Auth até a nova confirmação.
+  const { error } = await supabase.from('profiles').update({
+    name: profile.name.trim(),
+    avatar_uri: profile.avatarUri ?? null,
+    updated_at: new Date().toISOString(),
+  }).eq('id', user.id);
+  throwIfError(error);
+
+  if (requestedEmail === currentEmail) return { email: user.email, emailChangePending: false };
+  const emailRedirectTo = createAuthRedirectUrl({
+    platform: Platform.OS,
+    origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+    createUrl: ExpoLinking.createURL,
+  });
+  const { error: emailError } = await supabase.auth.updateUser(
+    { email: requestedEmail },
+    { emailRedirectTo }
+  );
+  if (emailError) {
+    // Nome e avatar já foram salvos; deixe claro que apenas a mudança de e-mail falhou.
+    return { email: user.email, emailChangePending: false, emailChangeError: emailError.message };
+  }
+  return { email: user.email, emailChangePending: true };
 }
 
 export async function getPreference(key) {
-  const db = await getDatabase();
-  const row = await db.getFirstAsync('SELECT value FROM app_preferences WHERE key = ?', [key]);
-  return row?.value ?? null;
+  return preferences()?.getItem(`meu-financeiro:${key}`) ?? null;
 }
 
 export async function setPreference(key, value) {
-  const db = await getDatabase();
-  await db.runAsync('INSERT OR REPLACE INTO app_preferences (key, value) VALUES (?, ?)', [key, String(value)]);
+  preferences()?.setItem(`meu-financeiro:${key}`, String(value));
 }
 
 export async function clearUserSession() {
-  const db = await getDatabase();
-  await db.runAsync('DELETE FROM user_session WHERE id = 1');
+  const { error } = await getSupabase().auth.signOut();
+  throwIfError(error);
 }
 
 export async function getTransactions(filter = 'todos') {
-  const db = await getDatabase();
-  const today = getLocalTodayIso();
-  const filters = {
-    pendente: ['WHERE status = ?', ['pendente']],
-    concluida: ['WHERE status = ?', ['concluida']],
-    futuras: ['WHERE due_date > ? AND status = ?', [today, 'pendente']],
-  };
-  const [where, params] = filters[filter] ?? ['', []];
-  return db.getAllAsync(`SELECT * FROM transactions ${where} ORDER BY due_date ASC, id DESC`, params);
+  let query = getSupabase()
+    .from('transactions')
+    .select('*')
+    .order('due_date', { ascending: true })
+    .order('created_at', { ascending: false });
+  if (filter === 'pendente') query = query.eq('status', 'pendente');
+  if (filter === 'concluida') query = query.eq('status', 'concluida');
+  if (filter === 'futuras') query = query.gt('due_date', getLocalTodayIso()).eq('status', 'pendente');
+  const { data, error } = await query;
+  throwIfError(error);
+  return data ?? [];
 }
 
 export async function saveTransaction(transaction, id = null) {
-  const db = await getDatabase();
-  const values = [transaction.type, transaction.description, transaction.amount, transaction.category, transaction.dueDate];
-  if (id) {
-    await db.runAsync('UPDATE transactions SET type=?, description=?, amount=?, category=?, due_date=? WHERE id=?', [...values, id]);
-    return id;
-  }
-  const result = await db.runAsync('INSERT INTO transactions (type, description, amount, category, due_date) VALUES (?, ?, ?, ?, ?)', values);
-  return result.lastInsertRowId;
+  const payload = {
+    type: transaction.type,
+    description: transaction.description,
+    amount: transaction.amount,
+    category: transaction.category,
+    due_date: transaction.dueDate,
+  };
+  const supabase = getSupabase();
+  const response = id
+    ? await supabase.from('transactions').update(payload).eq('id', id).select('id').single()
+    : await supabase.from('transactions').insert(payload).select('id').single();
+  throwIfError(response.error);
+  return response.data.id;
 }
 
 export async function deleteTransaction(id) {
-  const db = await getDatabase();
-  await db.runAsync('DELETE FROM transactions WHERE id = ?', [id]);
+  const { data, error } = await getSupabase().from('transactions').delete().eq('id', id).select('id');
+  throwIfError(error);
+  if (!data?.length) throw new Error('A transação não foi excluída. Confira sua sessão e tente novamente.');
 }
 
 export async function changeTransactionStatus(id, status) {
-  const db = await getDatabase();
-  await db.runAsync('UPDATE transactions SET status = ? WHERE id = ?', [status, id]);
+  const { error } = await getSupabase().from('transactions').update({ status }).eq('id', id);
+  throwIfError(error);
 }
 
 export async function getMonthlySummary() {
-  const db = await getDatabase();
   const month = getLocalTodayIso().slice(0, 7);
-  return db.getFirstAsync(`SELECT
-    COALESCE(SUM(CASE WHEN type='receita' THEN amount ELSE 0 END), 0) AS receitas,
-    COALESCE(SUM(CASE WHEN type='despesa' THEN amount ELSE 0 END), 0) AS despesas,
-    COALESCE(SUM(CASE WHEN type='despesa' AND status='pendente' THEN amount ELSE 0 END), 0) AS comprometido
-    FROM transactions WHERE substr(due_date, 1, 7) = ?`, [month]);
+  const startDate = `${month}-01`;
+  const nextMonthStart = new Date(`${startDate}T00:00:00Z`);
+  nextMonthStart.setUTCMonth(nextMonthStart.getUTCMonth() + 1);
+  const { data, error } = await getSupabase().from('transactions')
+    .select('type, amount, status')
+    .gte('due_date', startDate)
+    .lt('due_date', nextMonthStart.toISOString().slice(0, 10));
+  throwIfError(error);
+  return (data ?? []).reduce((summary, item) => ({
+    receitas: summary.receitas + (item.type === 'receita' ? Number(item.amount) : 0),
+    despesas: summary.despesas + (item.type === 'despesa' ? Number(item.amount) : 0),
+    comprometido: summary.comprometido + (item.type === 'despesa' && item.status === 'pendente' ? Number(item.amount) : 0),
+  }), { receitas: 0, despesas: 0, comprometido: 0 });
 }
 
 export async function getReminders() {
-  const db = await getDatabase();
-  return db.getAllAsync(`SELECT reminders.*, transactions.description AS transaction_description
-    FROM reminders LEFT JOIN transactions ON transactions.id = reminders.transaction_id
-    ORDER BY reminder_date ASC, reminder_time ASC`);
+  const { data, error } = await getSupabase().from('reminders')
+    .select('*, transactions(description)')
+    .order('reminder_date', { ascending: true })
+    .order('reminder_time', { ascending: true });
+  throwIfError(error);
+  return (data ?? []).map(({ transactions, ...reminder }) => ({
+    ...reminder,
+    transaction_description: transactions?.description ?? null,
+  }));
 }
 
 export async function saveReminder(reminder, notificationId, id = null) {
-  const db = await getDatabase();
-  const values = [reminder.title, reminder.notes, reminder.reminderDate, reminder.reminderTime, reminder.transactionId, notificationId];
-  if (id) {
-    await db.runAsync('UPDATE reminders SET title=?, notes=?, reminder_date=?, reminder_time=?, transaction_id=?, notification_id=? WHERE id=?', [...values, id]);
-    return id;
-  }
-  const result = await db.runAsync('INSERT INTO reminders (title, notes, reminder_date, reminder_time, transaction_id, notification_id) VALUES (?, ?, ?, ?, ?, ?)', values);
-  return result.lastInsertRowId;
+  const payload = {
+    title: reminder.title,
+    notes: reminder.notes,
+    reminder_date: reminder.reminderDate,
+    reminder_time: reminder.reminderTime,
+    transaction_id: reminder.transactionId || null,
+    notification_id: notificationId || null,
+  };
+  const supabase = getSupabase();
+  const response = id
+    ? await supabase.from('reminders').update(payload).eq('id', id).select('id').single()
+    : await supabase.from('reminders').insert(payload).select('id').single();
+  throwIfError(response.error);
+  return response.data.id;
 }
 
 export async function deleteReminder(id) {
-  const db = await getDatabase();
-  const reminder = await db.getFirstAsync('SELECT notification_id FROM reminders WHERE id = ?', [id]);
-  await db.runAsync('DELETE FROM reminders WHERE id = ?', [id]);
-  return reminder?.notification_id ?? null;
+  const supabase = getSupabase();
+  const { data, error } = await supabase.from('reminders').select('notification_id').eq('id', id).single();
+  throwIfError(error);
+  const { data: deleted, error: deleteError } = await supabase.from('reminders').delete().eq('id', id).select('id');
+  throwIfError(deleteError);
+  if (!deleted?.length) throw new Error('O lembrete não foi excluído. Confira sua sessão e tente novamente.');
+  return data?.notification_id ?? null;
 }

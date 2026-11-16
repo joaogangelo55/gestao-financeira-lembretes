@@ -1,3 +1,6 @@
+import { Platform } from 'react-native';
+import * as ExpoLinking from 'expo-linking';
+import { createAuthRedirectUrl } from '../services/authRedirect.mjs';
 import { getLocalTodayIso } from '../utils/dates.mjs';
 import { getSupabase } from '../services/supabaseClient';
 
@@ -21,7 +24,15 @@ async function profileFromUser(user) {
   const supabase = getSupabase();
   const { data, error } = await supabase.from('profiles').select('name, email, avatar_uri').eq('id', user.id).maybeSingle();
   throwIfError(error);
-  if (data) return { name: data.name, email: data.email, avatarUri: data.avatar_uri };
+  if (data) {
+    // Sincroniza cópia de email do perfil após a confirmação oficial no Auth.
+    if (user.email && data.email !== user.email) {
+      void supabase.from('profiles').update({ email: user.email }).eq('id', user.id)
+        .then(({ error }) => { if (error) console.warn('Não foi possível sincronizar o e-mail de perfil.'); })
+        .catch(() => { /* sincronização será tentada no próximo login */ });
+    }
+    return { name: data.name, email: user.email, avatarUri: data.avatar_uri };
+  }
 
   const fallback = {
     id: user.id,
@@ -57,14 +68,35 @@ export async function saveUserSession(credentials, mode = 'signin') {
 }
 
 export async function updateUserProfile(profile) {
+  const supabase = getSupabase();
   const user = await currentUser();
-  const { error } = await getSupabase().from('profiles').update({
-    name: profile.name,
-    email: profile.email,
+  const requestedEmail = String(profile.email || '').trim().toLowerCase();
+  const currentEmail = String(user.email || '').trim().toLowerCase();
+  if (!/^\S+@\S+\.\S+$/.test(requestedEmail)) throw new Error('E-mail inválido.');
+
+  // O e-mail exibido continua vindo de Supabase Auth até a nova confirmação.
+  const { error } = await supabase.from('profiles').update({
+    name: profile.name.trim(),
     avatar_uri: profile.avatarUri ?? null,
     updated_at: new Date().toISOString(),
   }).eq('id', user.id);
   throwIfError(error);
+
+  if (requestedEmail === currentEmail) return { email: user.email, emailChangePending: false };
+  const emailRedirectTo = createAuthRedirectUrl({
+    platform: Platform.OS,
+    origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+    createUrl: ExpoLinking.createURL,
+  });
+  const { error: emailError } = await supabase.auth.updateUser(
+    { email: requestedEmail },
+    { emailRedirectTo }
+  );
+  if (emailError) {
+    // Nome e avatar já foram salvos; deixe claro que apenas a mudança de e-mail falhou.
+    return { email: user.email, emailChangePending: false, emailChangeError: emailError.message };
+  }
+  return { email: user.email, emailChangePending: true };
 }
 
 export async function getPreference(key) {

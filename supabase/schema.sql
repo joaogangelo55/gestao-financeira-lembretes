@@ -36,6 +36,39 @@ create table if not exists public.reminders (
   updated_at timestamptz not null default now()
 );
 
+-- A referência composta impede vincular um lembrete a uma transação de outro usuário.
+-- Em um banco já existente, esta etapa falhará de forma segura se houver associações
+-- inconsistentes; corrija-as manualmente antes de reaplicar. Nenhum dado é apagado.
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'transactions_id_user_id_key'
+      and conrelid = 'public.transactions'::regclass
+  ) then
+    alter table public.transactions
+      add constraint transactions_id_user_id_key unique (id, user_id);
+  end if;
+end $$;
+
+alter table public.reminders
+  drop constraint if exists reminders_transaction_id_fkey;
+
+ do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'reminders_transaction_owner_fkey'
+      and conrelid = 'public.reminders'::regclass
+  ) then
+    alter table public.reminders
+      add constraint reminders_transaction_owner_fkey
+      foreign key (transaction_id, user_id)
+      references public.transactions (id, user_id)
+      on delete set null (transaction_id);
+  end if;
+end $$;
+
 create index if not exists transactions_user_due_date_idx on public.transactions (user_id, due_date);
 create index if not exists reminders_user_reminder_at_idx on public.reminders (user_id, reminder_date, reminder_time);
 

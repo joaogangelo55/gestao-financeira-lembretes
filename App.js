@@ -1,14 +1,18 @@
 import AuthWebScreen from './src/screens/AuthWebScreen';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert, FlatList, Image, KeyboardAvoidingView, Modal, Platform, Pressable, SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TextInput, View } from 'react-native';
 import * as SplashScreen from 'expo-splash-screen';
+import * as ExpoLinking from 'expo-linking';
+import { getSupabase } from './src/services/supabaseClient';
+import { parseAuthCallback } from './src/services/authCallback.mjs';
 import Avatar from './src/components/Avatar';
 import DateInput from './src/components/DateInput';
-import { changeTransactionStatus, clearUserSession, deleteReminder, deleteTransaction, getMonthlySummary, getPreference, getReminders, getTransactions, getUserSession, initDatabase, saveReminder, saveTransaction, saveUserSession, setPreference, updateUserProfile } from './src/database/transactions';
+import { changeTransactionStatus, clearUserSession, deleteReminder, deleteTransaction, getMonthlySummary, getPreference, getReminders, getTransactions, getUserSession, initDatabase, saveReminder, saveTransaction, setPreference, updateUserProfile } from './src/database/transactions';
 import { cancelReminder, prepareNotifications, scheduleReminder } from './src/services/notifications';
+import { persistAndScheduleReminder } from './src/services/reminderWorkflow.mjs';
 import { chooseProfileImage, removeProfileImage } from './src/services/profileImages';
 import { getLocalTodayIso, isoToBrDate } from './src/utils/dates.mjs';
-import { validateLogin, validateReminder, validateTransaction } from './src/utils/validation.mjs';
+import { validateReminder, validateTransaction } from './src/utils/validation.mjs';
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -57,8 +61,6 @@ export default function App() {
   const [error, setError] = useState(null);
   const [user, setUser] = useState(null);
   const [tab, setTab] = useState('início');
-  const [login, setLogin] = useState({ name: '', email: '', password: '' });
-  const [authMode, setAuthMode] = useState(Platform.OS === 'web' ? 'signin' : 'signup');
   const [transactions, setTransactions] = useState([]);
   const [reminders, setReminders] = useState([]);
   const [summary, setSummary] = useState({ receitas: 0, despesas: 0, comprometido: 0 });
@@ -66,6 +68,9 @@ export default function App() {
   const [transactionForm, setTransactionForm] = useState(null);
   const [reminderForm, setReminderForm] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [authScreenMode, setAuthScreenMode] = useState(null);
+  const recoveryFlowRef = useRef(false);
+  const authLoadSequenceRef = useRef(0);
 
   async function refresh(currentFilter = filter) {
     const [items, reminderItems, monthly] = await Promise.all([getTransactions(currentFilter), getReminders(), getMonthlySummary()]);
@@ -75,15 +80,19 @@ export default function App() {
     try {
       setError(null); setPhase('loading');
       await initDatabase();
-      if (
-        Platform.OS === 'web' &&
-        typeof window !== 'undefined' &&
-        new URLSearchParams(window.location.search).get('recover') === '1'
-      ) {
+      if (Platform.OS === 'web' && typeof window !== 'undefined' &&
+        new URLSearchParams(window.location.search).get('recover') === '1') {
+        recoveryFlowRef.current = true;
+        setAuthScreenMode('reset');
         setPhase('login');
         return;
       }
       const savedUser = await getUserSession();
+      if (recoveryFlowRef.current) {
+        setAuthScreenMode('reset');
+        setPhase('login');
+        return;
+      }
       const onboarding = await getPreference('onboarding_completed');
       // A API financeira exige autenticação; não consultar antes do login.
       if (savedUser) {
@@ -93,27 +102,113 @@ export default function App() {
         setReminders([]);
         setSummary({ receitas: 0, despesas: 0, comprometido: 0 });
       }
+      if (recoveryFlowRef.current) {
+        setAuthScreenMode('reset'); setPhase('login'); return;
+      }
       setUser(savedUser);
       setPhase(savedUser ? 'app' : onboarding === 'true' ? 'login' : 'onboarding');
     } catch (cause) { console.error('Falha ao inicializar', cause); setError(Platform.OS === 'web' ? 'Não foi possível carregar os dados na nuvem. Verifique a conexão e consulte o Console do navegador.' : 'Não foi possível preparar os dados locais. Seus dados não foram apagados.'); setPhase('error'); }
     finally { SplashScreen.hideAsync().catch(() => {}); }
   }
   useEffect(() => { initialize(); }, []);
+  // Único listener global. Nenhum método do Supabase é chamado dentro do callback.
+  useEffect(() => {
+    let active = true;
+    const processed = new Set();
+    const isWebRecovery = () => Platform.OS === 'web' &&
+      typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('recover') === '1';
+
+    const clearInMemoryData = () => {
+      setTransactions([]); setReminders([]);
+      setSummary({ receitas: 0, despesas: 0, comprometido: 0 });
+    };
+    const loadAuthenticatedUser = async () => {
+      const sequence = ++authLoadSequenceRef.current;
+      if (recoveryFlowRef.current || isWebRecovery()) return;
+      const authenticatedUser = await getUserSession();
+      if (!active || sequence !== authLoadSequenceRef.current || !authenticatedUser || recoveryFlowRef.current || isWebRecovery()) return;
+      const [items, reminderItems, monthly] = await Promise.all([
+        getTransactions(filter), getReminders(), getMonthlySummary(),
+      ]);
+      if (!active || sequence !== authLoadSequenceRef.current || recoveryFlowRef.current || isWebRecovery()) return;
+      setTransactions(items); setReminders(reminderItems); setSummary(monthly || {});
+      setUser(authenticatedUser); setPhase('app'); setAuthScreenMode(null);
+    };
+    const deferAuthLoad = () => {
+      setTimeout(() => {
+        if (!active || recoveryFlowRef.current || isWebRecovery()) return;
+        void loadAuthenticatedUser().catch((cause) => {
+          if (active) showFeedback('Não foi possível carregar sua conta', cause.message || 'Tente novamente.');
+        });
+      }, 0);
+    };
+    const completeLink = async (url) => {
+      if (Platform.OS === 'web' || !url || processed.has(url)) return;
+      const callback = parseAuthCallback(url);
+      if (!callback) return;
+      processed.add(url);
+      if (callback.kind === 'error') {
+        showFeedback('Link inválido ou expirado', callback.message || 'Solicite outro link.');
+        return;
+      }
+      if (callback.type === 'recovery') {
+        recoveryFlowRef.current = true;
+        authLoadSequenceRef.current++;
+        setAuthScreenMode('reset'); setPhase('login');
+      }
+      const auth = getSupabase().auth;
+      const result = callback.kind === 'pkce'
+        ? await auth.exchangeCodeForSession(callback.code)
+        : await auth.setSession({ access_token: callback.accessToken, refresh_token: callback.refreshToken });
+      if (result.error) throw result.error;
+      if (callback.type !== 'recovery') deferAuthLoad();
+    };
+    const { data: { subscription } } = getSupabase().auth.onAuthStateChange((event, session) => {
+      if (!active) return;
+      if (event === 'PASSWORD_RECOVERY') {
+        recoveryFlowRef.current = true;
+        authLoadSequenceRef.current++;
+        setAuthScreenMode('reset'); setPhase('login');
+        return;
+      }
+      if (event === 'SIGNED_OUT') {
+        recoveryFlowRef.current = false;
+        authLoadSequenceRef.current++;
+        clearInMemoryData(); setUser(null); setAuthScreenMode(null); setPhase('login');
+        return;
+      }
+      if ((event === 'SIGNED_IN' || event === 'INITIAL_SESSION') && session?.user &&
+        !recoveryFlowRef.current && !isWebRecovery()) {
+        deferAuthLoad();
+      }
+      // TOKEN_REFRESHED não exige recarregar todas as transações do usuário.
+    });
+    const linkSubscription = Platform.OS === 'web' ? null : ExpoLinking.addEventListener('url', ({ url }) => {
+      void completeLink(url).catch((cause) => showFeedback('Link inválido ou expirado', cause.message || 'Solicite outro link.'));
+    });
+    if (Platform.OS !== 'web') ExpoLinking.getInitialURL()
+      .then((url) => void completeLink(url).catch(() => {})).catch(() => {});
+    return () => {
+      active = false;
+      authLoadSequenceRef.current++;
+      subscription.unsubscribe();
+      linkSubscription?.remove();
+    };
+  }, []);
   useEffect(() => { if (phase === 'app') refresh().catch((cause) => Alert.alert('Erro ao atualizar', cause.message)); }, [filter]);
 
   async function completeOnboarding() { await setPreference('onboarding_completed', 'true'); setPhase(user ? 'app' : 'login'); }
-  async function submitLogin() {
-    const result = validateLogin(login, { requireName: Platform.OS !== 'web' || authMode === 'signup' }); if (!result.valid) return showFeedback('Revise seus dados', result.error);
+  async function handleAuthenticated() {
     try {
       setBusy(true);
-      const authenticatedUser = await saveUserSession(result.value, authMode);
-      // Após autenticar, carregar os dados do usuário recém-logado.
+      const authenticatedUser = await getUserSession();
+      if (!authenticatedUser) throw new Error('A sessão não foi estabelecida. Tente entrar novamente.');
       await refresh();
       setUser(authenticatedUser);
-      setLogin({ name: '', email: '', password: '' });
       setPhase('app');
     } catch (cause) {
-      showFeedback(authMode === 'signup' ? 'Não foi possível criar a conta' : 'Não foi possível entrar', cause.message);
+      showFeedback('Não foi possível abrir o painel', cause.message || 'Tente entrar novamente.');
     } finally {
       setBusy(false);
     }
@@ -124,22 +219,32 @@ export default function App() {
     try { setBusy(true); await saveTransaction(result.value, transactionForm.id); setTransactionForm(null); await refresh(); } catch (cause) { showFeedback('Não foi possível salvar', cause.message); } finally { setBusy(false); }
   }
   async function submitReminder() {
-    const result = validateReminder(reminderForm); if (!result.valid) return showFeedback('Revise os dados', result.error);
+    const result = validateReminder(reminderForm);
+    if (!result.valid) return showFeedback('Revise os dados', result.error);
     try {
       setBusy(true);
-      const nextNotificationId = await scheduleReminder(result.value);
-      const notificationId = nextNotificationId ?? reminderForm.notificationId ?? null;
-      await saveReminder(result.value, notificationId, reminderForm.id);
-      if (nextNotificationId && reminderForm.notificationId && reminderForm.notificationId !== nextNotificationId) await cancelReminder(reminderForm.notificationId);
-      setReminderForm(null); await refresh();
-      if (!nextNotificationId) showFeedback('Lembrete salvo', Platform.OS === 'web' ? 'O lembrete foi salvo na nuvem. A versão Web ainda não envia avisos automáticos.' : reminderForm.notificationId ? 'A notificação anterior foi preservada. Revise a permissão para atualizar o aviso.' : 'O lembrete foi salvo, mas a permissão de notificação não foi concedida.');
-    } catch (cause) { showFeedback('Não foi possível salvar o lembrete', cause.message); } finally { setBusy(false); }
+      const operation = await persistAndScheduleReminder({
+        reminder: result.value,
+        id: reminderForm.id ?? null,
+        previousNotificationId: reminderForm.notificationId ?? null,
+        save: saveReminder,
+        schedule: scheduleReminder,
+        cancel: cancelReminder,
+      });
+      setReminderForm(null);
+      await refresh();
+      if (operation.warning) showFeedback('Lembrete salvo', operation.warning);
+    } catch (cause) {
+      showFeedback('Não foi possível salvar o lembrete', cause.message || 'Tente novamente.');
+    } finally {
+      setBusy(false);
+    }
   }
   const balance = Number(summary.receitas || 0) - Number(summary.despesas || 0);
   if (phase === 'loading') return <Loading />;
   if (phase === 'error') return <Failure message={error} onRetry={initialize} />;
   if (phase === 'onboarding') return <Onboarding onDone={completeOnboarding} />;
-  if (phase === 'login') return <LoginScreen value={login} setValue={setLogin} onSubmit={submitLogin} busy={busy} authMode={authMode} setAuthMode={setAuthMode} usesCloudAuth={Platform.OS === 'web'} />;
+  if (phase === 'login') return <LoginScreen onAuthenticated={handleAuthenticated} requestedMode={authScreenMode} />;
   return <SafeAreaView style={styles.safe}><StatusBar barStyle="dark-content" />
     <View style={styles.app}>
       {tab === 'início' && <Dashboard user={user} balance={balance} summary={summary} reminders={reminders} onFinance={() => { setTab('finanças'); setTransactionForm(newTransaction()); }} onReminder={() => { setTab('lembretes'); setReminderForm(newReminder()); }} onProfile={() => setTab('ajustes')} />}
@@ -157,14 +262,14 @@ export default function App() {
 function Loading() { return <SafeAreaView style={styles.center}><Text style={styles.title}>Preparando o Meu Financeiro…</Text></SafeAreaView>; }
 function Failure({ message, onRetry }) { return <SafeAreaView style={styles.center}><Text style={styles.title}>Algo não saiu como esperado</Text><Text style={styles.muted}>{message}</Text><Button title="Tentar novamente" onPress={onRetry} /></SafeAreaView>; }
 function Onboarding({ onDone }) { const [page, setPage] = useState(0); const pages = [['Organize seu dinheiro com facilidade', 'Registre receitas, despesas e contas a pagar. Acompanhe suas movimentações e tenha uma visão clara das suas finanças.', '◔'], ['Não esqueça seus compromissos', 'Crie lembretes, acompanhe vencimentos e receba notificações locais para organizar melhor sua rotina.', '◷'], ['Mais controle, menos preocupação', 'Visualize seu resumo financeiro, acompanhe suas pendências e organize tudo em um único aplicativo.', '↗']]; const [title, copy, icon] = pages[page]; return <SafeAreaView style={styles.onboarding}><Pressable accessibilityRole="button" style={styles.skip} onPress={onDone}><Text style={styles.link}>Pular</Text></Pressable><View style={styles.onboardingBody}><Text style={styles.onboardingIcon}>{icon}</Text><Text style={styles.onboardingTitle}>{title}</Text><Text style={styles.onboardingCopy}>{copy}</Text></View><View style={styles.dots}>{pages.map((_, index) => <View key={index} style={[styles.dotPage, page === index && styles.dotPageActive]} />)}</View><View style={styles.onboardingActions}>{page > 0 && <Button title="Voltar" variant="secondary" onPress={() => setPage(page - 1)} />}{page < 2 ? <Button title="Próximo" onPress={() => setPage(page + 1)} /> : <Button title="Começar a usar" onPress={onDone} />}</View></SafeAreaView>; }
-function LoginScreen({ value, setValue, onSubmit, busy, authMode, setAuthMode, usesCloudAuth }) {
-  if (Platform.OS === 'web') return <AuthWebScreen />;
- const creatingAccount = usesCloudAuth && authMode === 'signup'; return <SafeAreaView style={styles.login}><KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}><ScrollView contentContainerStyle={styles.loginScroll} keyboardShouldPersistTaps="handled"><Brand /><Text style={styles.bigTitle}>{creatingAccount ? 'Comece a organizar,\ncom segurança.' : 'Seu dinheiro,\ndo seu jeito.'}</Text><Text style={styles.subheading}>{usesCloudAuth ? creatingAccount ? 'Crie sua conta para acessar seus registros de qualquer navegador.' : 'Entre para acessar seus dados financeiros protegidos.' : 'Entrada demonstrativa local, sem servidor ou conta bancária.'}</Text><View style={styles.card}>{(!usesCloudAuth || creatingAccount) && <Field label="Seu nome" value={value.name} onChangeText={(name) => setValue({ ...value, name })} placeholder="Ex.: Ana Silva"/>}<Field label="E-mail" value={value.email} onChangeText={(email) => setValue({ ...value, email })} placeholder="voce@email.com" keyboardType="email-address" autoCapitalize="none"/><Field label={usesCloudAuth ? 'Senha' : 'Senha demonstrativa'} value={value.password} onChangeText={(password) => setValue({ ...value, password })} placeholder="Pelo menos 6 caracteres" secureTextEntry/><Button title={busy ? 'Aguarde…' : usesCloudAuth && creatingAccount ? 'Criar minha conta' : 'Entrar no meu painel'} onPress={onSubmit} disabled={busy}/>{usesCloudAuth && <Pressable accessibilityRole="button" onPress={() => { setAuthMode(creatingAccount ? 'signin' : 'signup'); setValue({ name: '', email: value.email, password: '' }); }}><Text style={styles.link}>{creatingAccount ? 'Já tenho conta: entrar' : 'Ainda não tenho conta: criar agora'}</Text></Pressable>}</View></ScrollView></KeyboardAvoidingView></SafeAreaView>; }
+function LoginScreen({ onAuthenticated, requestedMode }) {
+  return <AuthWebScreen onAuthenticated={onAuthenticated} requestedMode={requestedMode} />;
+}
 function Dashboard({ user, balance, summary, reminders, onFinance, onReminder, onProfile }) { return <ScrollView contentContainerStyle={styles.scroll}><View style={styles.top}><Brand compact/><Pressable onPress={onProfile} accessibilityLabel="Abrir perfil"><Avatar name={user.name} uri={user.avatarUri} /></Pressable></View><Text style={styles.eyebrow}>VISÃO GERAL</Text><Text style={styles.heading}>Olá, {user.name.split(' ')[0]}.</Text><View style={styles.balanceCard}><Text style={styles.balanceLabel}>Saldo previsto</Text><Text style={styles.balance}>{money(balance)}</Text><Text style={styles.light}>Considerando receitas e despesas deste mês</Text></View><View style={styles.stats}><Stat label="Receitas" value={money(summary.receitas)} color="#075e35"/><Stat label="Despesas" value={money(summary.despesas)} color="#b42318"/></View><Text style={styles.section}>Ações rápidas</Text><View style={styles.quick}><Quick title="Nova transação" icon="＋" onPress={onFinance}/><Quick title="Novo lembrete" icon="◷" onPress={onReminder}/></View><Text style={styles.section}>Próximos lembretes</Text>{reminders.slice(0, 3).map((item) => <View style={styles.row} key={item.id}><Text style={styles.rowTitle}>{item.title}</Text><Text style={styles.muted}>{isoToBrDate(item.reminder_date)} às {item.reminder_time}</Text></View>)}{!reminders.length && <Text style={styles.empty}>Você ainda não possui lembretes.</Text>}</ScrollView>; }
 function Finance({ transactions, filter, setFilter, onAdd, onEdit, onDelete, onStatus }) { return <View style={styles.page}><View style={financeActions.header}><Text style={styles.heading}>Finanças</Text><Pressable accessibilityRole="button" accessibilityLabel="Adicionar nova transação" onPress={onAdd} style={financeActions.add}><Text style={financeActions.addText}>＋ Nova transação</Text></Pressable></View><ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filters}>{[['todos','Todas'],['pendente','Pendentes'],['concluida','Pagas'],['futuras','Futuras']].map(([id, label]) => <Pressable key={id} onPress={() => setFilter(id)} style={[styles.chip, filter === id && styles.chipActive]}><Text>{label}</Text></Pressable>)}</ScrollView><FlatList data={transactions} keyExtractor={(item) => String(item.id)} contentContainerStyle={styles.list} ListEmptyComponent={<Text style={styles.empty}>Nenhuma transação neste filtro.</Text>} renderItem={({ item }) => <View style={styles.item}><View style={styles.itemMain}><Text style={styles.rowTitle}>{item.description}</Text><Text style={styles.muted}>{item.category} · vence em {isoToBrDate(item.due_date)}</Text><View style={styles.actions}><Text style={styles.link} onPress={() => onStatus(item)}>{item.status === 'pendente' ? 'Marcar paga' : 'Reabrir'}</Text><Text style={styles.link} onPress={() => onEdit(item)}>Editar</Text><Text style={styles.delete} onPress={() => onDelete(item)}>Excluir</Text></View></View><Text style={[styles.amount, { color: item.type === 'receita' ? '#075e35' : '#b42318' }]}>{item.type === 'receita' ? '+' : '-'}{money(item.amount)}</Text></View>}/></View>; }
 function Reminders({ reminders, onAdd, onEdit, onDelete }) { return <View style={styles.page}><View style={financeActions.header}><Text style={styles.heading}>Lembretes</Text><Pressable accessibilityRole="button" accessibilityLabel="Adicionar novo lembrete" onPress={onAdd} style={financeActions.add}><Text style={financeActions.addText}>＋ Novo lembrete</Text></Pressable></View><Text style={styles.subheading}>{Platform.OS === 'web' ? 'Lembretes salvos na nuvem. Avisos automáticos ainda não estão disponíveis na versão Web.' : 'Notificações são locais e dependem da permissão do aparelho.'}</Text><FlatList data={reminders} keyExtractor={(item) => String(item.id)} contentContainerStyle={styles.list} ListEmptyComponent={<Text style={styles.empty}>Nenhum lembrete agendado.</Text>} renderItem={({ item }) => <View style={styles.item}><View style={styles.itemMain}><Text style={styles.rowTitle}>{item.title}</Text><Text style={styles.muted}>{isoToBrDate(item.reminder_date)} às {item.reminder_time}</Text><View style={styles.actions}><Text style={styles.link} onPress={() => onEdit(item)}>Editar</Text><Text style={styles.delete} onPress={() => onDelete(item)}>Excluir</Text></View></View></View>}/></View>; }
-function Settings({ user, onProfile, onOnboarding, onLogout }) { const [notice, setNotice] = useState(''); return <ScrollView contentContainerStyle={styles.scroll}><Text style={styles.heading}>Ajustes</Text><Text style={styles.section}>Meu perfil</Text><Pressable style={styles.setting} onPress={onProfile}><Avatar name={user.name} uri={user.avatarUri}/><View><Text style={styles.rowTitle}>{user.name}</Text><Text style={styles.muted}>{user.email}</Text></View><Text style={styles.link}>Editar</Text></Pressable><Text style={styles.section}>Notificações</Text><Button title="Verificar e solicitar permissão" onPress={async () => { const granted = await prepareNotifications(); setNotice(granted ? 'Notificações locais permitidas neste aparelho.' : 'Permissão não concedida. Ative nas configurações do sistema se desejar receber avisos.'); }} variant="secondary"/><Text style={styles.muted}>{notice}</Text><Text style={styles.section}>Preferências regionais</Text><View style={styles.card}><Text>Idioma: Português (Brasil)</Text><Text>Moeda: Real brasileiro (BRL)</Text><Text>Datas: DD/MM/AAAA</Text></View><Text style={styles.section}>Introdução</Text><Button title="Ver apresentação novamente" onPress={onOnboarding} variant="secondary"/><Text style={styles.section}>Sobre e privacidade</Text><View style={styles.card}><Text style={styles.rowTitle}>Meu Financeiro · versão 1.0.0</Text><Text style={styles.muted}>Projeto acadêmico. Dados, fotos e movimentações ficam neste aparelho; não há sincronização em nuvem, conta bancária real ou autenticação de servidor.</Text></View><Button title="Sair da sessão" onPress={() => confirmAction('Sair da sessão?', Platform.OS === 'web' ? 'Seus dados permanecerão salvos na nuvem.' : 'As movimentações permanecem neste aparelho.', 'Sair', onLogout)} variant="danger"/></ScrollView>; }
-function Profile({ user, onBack, onSaved }) { const [draft, setDraft] = useState(user); const [busy, setBusy] = useState(false); async function photo() { try { const result = await chooseProfileImage(); if (!result.cancelled) setDraft({ ...draft, avatarUri: result.uri }); else if (result.reason === 'permission') Alert.alert('Permissão necessária', 'Permita acesso às fotos para escolher um avatar.'); } catch (cause) { Alert.alert('Não foi possível usar a foto', cause.message); } } async function save() { if (draft.name.trim().length < 2 || !/^\S+@\S+\.\S+$/.test(draft.email)) return Alert.alert('Revise o perfil', 'Informe nome e e-mail válidos.'); try { setBusy(true); await updateUserProfile({ ...draft, name: draft.name.trim(), email: draft.email.trim().toLowerCase() }); if (user.avatarUri && user.avatarUri !== draft.avatarUri) removeProfileImage(user.avatarUri); onSaved({ ...draft, name: draft.name.trim(), email: draft.email.trim().toLowerCase() }); Alert.alert('Perfil salvo', 'Suas alterações foram mantidas neste aparelho.'); onBack(); } catch (cause) { Alert.alert('Não foi possível salvar', cause.message); } finally { setBusy(false); } } return <ScrollView contentContainerStyle={styles.scroll}><Text style={styles.link} onPress={onBack}>‹ Voltar aos ajustes</Text><Text style={styles.heading}>Meu perfil</Text><View style={styles.profileAvatar}><Avatar name={draft.name} uri={draft.avatarUri} size={112}/></View><Button title="Alterar foto" onPress={photo} variant="secondary"/>{draft.avatarUri && <Button title="Remover foto" onPress={() => setDraft({ ...draft, avatarUri: null })} variant="danger"/>}<Field label="Nome" value={draft.name} onChangeText={(name) => setDraft({ ...draft, name })}/><Field label="E-mail" value={draft.email} keyboardType="email-address" autoCapitalize="none" onChangeText={(email) => setDraft({ ...draft, email })}/><Button title={busy ? 'Salvando…' : 'Salvar alterações'} onPress={save} disabled={busy}/></ScrollView>; }
+function Settings({ user, onProfile, onOnboarding, onLogout }) { const [notice, setNotice] = useState(''); return <ScrollView contentContainerStyle={styles.scroll}><Text style={styles.heading}>Ajustes</Text><Text style={styles.section}>Meu perfil</Text><Pressable style={styles.setting} onPress={onProfile}><Avatar name={user.name} uri={user.avatarUri}/><View><Text style={styles.rowTitle}>{user.name}</Text><Text style={styles.muted}>{user.email}</Text></View><Text style={styles.link}>Editar</Text></Pressable><Text style={styles.section}>Notificações</Text><Button title="Verificar e solicitar permissão" onPress={async () => { const granted = await prepareNotifications(); setNotice(granted ? 'Notificações locais permitidas neste aparelho.' : 'Permissão não concedida. Ative nas configurações do sistema se desejar receber avisos.'); }} variant="secondary"/><Text style={styles.muted}>{notice}</Text><Text style={styles.section}>Preferências regionais</Text><View style={styles.card}><Text>Idioma: Português (Brasil)</Text><Text>Moeda: Real brasileiro (BRL)</Text><Text>Datas: DD/MM/AAAA</Text></View><Text style={styles.section}>Introdução</Text><Button title="Ver apresentação novamente" onPress={onOnboarding} variant="secondary"/><Text style={styles.section}>Sobre e privacidade</Text><View style={styles.card}><Text style={styles.rowTitle}>Meu Financeiro · versão 1.0.0</Text><Text style={styles.muted}>Projeto acadêmico. Sua autenticação, seus dados financeiros e seu perfil utilizam o Supabase. Notificações são locais no celular. Não há integração com contas bancárias.</Text></View><Button title="Sair da sessão" onPress={() => confirmAction('Sair da sessão?', 'Seus registros permanecerão na sua conta do Supabase.', 'Sair', onLogout)} variant="danger"/></ScrollView>; }
+function Profile({ user, onBack, onSaved }) { const [draft, setDraft] = useState(user); const [busy, setBusy] = useState(false); async function photo() { try { const result = await chooseProfileImage(); if (!result.cancelled) setDraft({ ...draft, avatarUri: result.uri }); else if (result.reason === 'permission') Alert.alert('Permissão necessária', 'Permita acesso às fotos para escolher um avatar.'); } catch (cause) { Alert.alert('Não foi possível usar a foto', cause.message); } } async function save() { if (draft.name.trim().length < 2 || !/^\S+@\S+\.\S+$/.test(draft.email)) return Alert.alert('Revise o perfil', 'Informe nome e e-mail válidos.'); try { setBusy(true); const result = await updateUserProfile({ ...draft, name: draft.name.trim(), email: draft.email.trim().toLowerCase() }); if (user.avatarUri && user.avatarUri !== draft.avatarUri) { try { await removeProfileImage(user.avatarUri); } catch (cleanupError) { console.warn('Não foi possível remover a foto anterior.'); } } onSaved({ ...draft, name: draft.name.trim(), email: result.email }); showFeedback('Perfil atualizado', result.emailChangePending ? 'Nome e foto salvos. Confirme a troca de e-mail pelos links enviados antes de usar o novo endereço.' : result.emailChangeError ? `Nome e foto salvos, mas a troca de e-mail não foi solicitada: ${result.emailChangeError}` : 'As alterações foram salvas na sua conta.'); onBack(); } catch (cause) { Alert.alert('Não foi possível salvar', cause.message); } finally { setBusy(false); } } return <ScrollView contentContainerStyle={styles.scroll}><Text style={styles.link} onPress={onBack}>‹ Voltar aos ajustes</Text><Text style={styles.heading}>Meu perfil</Text><View style={styles.profileAvatar}><Avatar name={draft.name} uri={draft.avatarUri} size={112}/></View><Button title="Alterar foto" onPress={photo} variant="secondary"/>{draft.avatarUri && <Button title="Remover foto" onPress={() => setDraft({ ...draft, avatarUri: null })} variant="danger"/>}<Field label="Nome" value={draft.name} onChangeText={(name) => setDraft({ ...draft, name })}/><Field label="E-mail" value={draft.email} keyboardType="email-address" autoCapitalize="none" onChangeText={(email) => setDraft({ ...draft, email })}/><Button title={busy ? 'Salvando…' : 'Salvar alterações'} onPress={save} disabled={busy}/></ScrollView>; }
 function TransactionModal({ value, setValue, onSave, busy }) { return <FormModal visible={!!value} title={value?.id ? 'Editar transação' : 'Nova transação'} onClose={() => setValue(null)} onSave={onSave} busy={busy}>{value && <><View style={styles.typeRow}>{['despesa', 'receita'].map((type) => <Pressable key={type} style={[styles.chip, value.type === type && styles.chipActive]} onPress={() => setValue({ ...value, type })}><Text>{type === 'despesa' ? 'Despesa' : 'Receita'}</Text></Pressable>)}</View><Field label="Descrição" value={value.description} onChangeText={(description) => setValue({ ...value, description })}/><Field label="Valor (R$)" value={String(value.amount)} keyboardType="decimal-pad" onChangeText={(amount) => setValue({ ...value, amount })}/><Field label="Categoria" value={value.category} onChangeText={(category) => setValue({ ...value, category })}/><DateField value={value.dueDate} onChangeText={(dueDate) => setValue({ ...value, dueDate })}/></>}</FormModal>; }
 function ReminderModal({ value, setValue, transactions, onSave, busy }) { return <FormModal visible={!!value} title={value?.id ? 'Editar lembrete' : 'Novo lembrete'} onClose={() => setValue(null)} onSave={onSave} busy={busy}>{value && <><Field label="Título" value={value.title} onChangeText={(title) => setValue({ ...value, title })}/><Field label="Observações" value={value.notes} onChangeText={(notes) => setValue({ ...value, notes })}/><DateField value={value.reminderDate} onChangeText={(reminderDate) => setValue({ ...value, reminderDate })}/><Field label="Horário" value={value.reminderTime} placeholder="HH:MM" onChangeText={(reminderTime) => setValue({ ...value, reminderTime })}/><Text style={styles.label}>Associar transação (opcional)</Text><ScrollView horizontal>{[null, ...transactions].map((item) => <Pressable key={item?.id ?? 'none'} onPress={() => setValue({ ...value, transactionId: item?.id ?? null })} style={[styles.chip, value.transactionId === (item?.id ?? null) && styles.chipActive]}><Text>{item?.description ?? 'Sem associação'}</Text></Pressable>)}</ScrollView></>}</FormModal>; }
 function FormModal({ visible, title, children, onClose, onSave, busy }) { return <Modal visible={visible} animationType="slide" transparent><KeyboardAvoidingView style={styles.shade} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}><View style={styles.modal}><View style={styles.top}><Text style={styles.title}>{title}</Text><Text style={styles.link} onPress={onClose}>Fechar</Text></View><ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>{children}</ScrollView><Button title={busy ? 'Salvando…' : 'Salvar'} onPress={onSave} disabled={busy}/></View></KeyboardAvoidingView></Modal>; }

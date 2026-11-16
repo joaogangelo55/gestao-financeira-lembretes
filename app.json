@@ -3,20 +3,26 @@
     "name": "Meu Financeiro",
     "slug": "gestao-financeira-lembretes",
     "version": "1.0.0",
+    "scheme": "meufinanceiro",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.meufinanceiro.academico"
     },
     "android": {
+      "package": "com.meufinanceiro.academico",
       "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+      },
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -45,7 +51,13 @@
         }
       ],
       "@react-native-community/datetimepicker",
-      "expo-status-bar"
-    ]
+      "expo-status-bar",
+      "expo-secure-store"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "66518668-f732-4c3d-93ef-dedea4e69e6e"
+      }
+    }
   }
 }

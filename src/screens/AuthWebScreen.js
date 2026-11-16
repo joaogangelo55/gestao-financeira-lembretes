@@ -1,8 +1,9 @@
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -14,7 +15,9 @@ import {
   View,
 } from 'react-native';
 
+import * as ExpoLinking from 'expo-linking';
 import { getSupabase } from '../services/supabaseClient';
+import { createAuthRedirectUrl } from '../services/authRedirect.mjs';
 
 // Validação básica de formato.
 // A confirmação da propriedade do e-mail é feita pelo Supabase.
@@ -30,9 +33,20 @@ const recoveryUrl = () =>
     .get('recover') === '1';
 
 function notice(title, message) {
-  if (typeof window !== 'undefined') {
+  if (Platform.OS === 'web' && typeof window !== 'undefined') {
     window.alert(`${title}\n\n${message}`);
+    return;
   }
+  Alert.alert(title, message);
+}
+
+function authRedirectUrl(recovery = false) {
+  return createAuthRedirectUrl({
+    platform: Platform.OS,
+    recovery,
+    origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+    createUrl: ExpoLinking.createURL,
+  });
 }
 
 function Input({ label, ...props }) {
@@ -84,10 +98,12 @@ function Link({ title, onPress, disabled }) {
   );
 }
 
-export default function AuthWebScreen() {
-  const [mode, setMode] = useState(
-    recoveryUrl() ? 'reset' : 'signin'
-  );
+export default function AuthWebScreen({ onAuthenticated, requestedMode = null }) {
+  const [mode, setMode] = useState(requestedMode || (recoveryUrl() ? 'reset' : 'signin'));
+
+  useEffect(() => {
+    if (requestedMode) setMode(requestedMode);
+  }, [requestedMode]);
 
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -95,7 +111,6 @@ export default function AuthWebScreen() {
   const [confirmPassword, setConfirmPassword] =
     useState('');
 
-  const [code, setCode] = useState('');
   const [newPassword, setNewPassword] =
     useState('');
   const [confirmNewPassword, setConfirmNewPassword] =
@@ -103,10 +118,17 @@ export default function AuthWebScreen() {
 
   const [busy, setBusy] = useState(false);
 
+  async function openPanel() {
+    // A navegação pertence ao App.js; nunca reiniciar a página para trocar de tela.
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+    await onAuthenticated?.();
+  }
+
   function changeMode(next) {
     setPassword('');
     setConfirmPassword('');
-    setCode('');
     setMode(next);
   }
 
@@ -152,17 +174,6 @@ export default function AuthWebScreen() {
     }
 
     if (
-      mode === 'verify' &&
-      !/^\d{6,8}$/.test(code.trim())
-    ) {
-      notice(
-        'Código inválido',
-        'Informe o código numérico recebido por e-mail.'
-      );
-      return;
-    }
-
-    if (
       mode === 'reset' &&
       newPassword.length < 8
     ) {
@@ -200,8 +211,7 @@ export default function AuthWebScreen() {
         if (error) throw error;
 
         // A sessão fica salva pelo cliente Supabase.
-        // Recarrega para abrir o painel financeiro.
-        window.location.reload();
+        await openPanel();
       }
 
       // CRIAR NOVA CONTA
@@ -213,7 +223,7 @@ export default function AuthWebScreen() {
             data: {
               name: name.trim(),
             },
-            emailRedirectTo: window.location.origin,
+            emailRedirectTo: authRedirectUrl(),
           },
         });
 
@@ -222,39 +232,15 @@ export default function AuthWebScreen() {
         // Se a confirmação de e-mail estiver desativada,
         // o Supabase poderá retornar uma sessão diretamente.
         if (data.session) {
-          window.location.reload();
+          await openPanel();
           return;
         }
 
-        // Com confirmação ativada, session=null é normal.
+        // A confirmação é feita SOMENTE pelo link enviado por e-mail.
+        // Esta tela não pede um código de segurança.
         setPassword('');
         setConfirmPassword('');
-        setMode('verify');
-
-        notice(
-          'Verifique seu e-mail',
-          'Se o cadastro puder ser concluído, chegará um código ou link de confirmação. Confira também o spam.'
-        );
-      }
-
-      // CONFIRMAÇÃO DE CADASTRO COM CÓDIGO
-      else if (mode === 'verify') {
-        const { data, error } = await auth.verifyOtp({
-          email: emailClean(email),
-          token: code.trim(),
-          type: 'email',
-        });
-
-        if (error) throw error;
-
-        if (!data.session) {
-          throw new Error(
-            'Confirmação recebida, mas nenhuma sessão foi criada.'
-          );
-        }
-
-        // Usuário verificado: abrir o painel.
-        window.location.reload();
+        setMode('pending');
       }
 
       // SOLICITAÇÃO DE RECUPERAÇÃO
@@ -263,8 +249,7 @@ export default function AuthWebScreen() {
           await auth.resetPasswordForEmail(
             emailClean(email),
             {
-              redirectTo:
-                `${window.location.origin}/?recover=1`,
+              redirectTo: authRedirectUrl(true),
             }
           );
 
@@ -310,11 +295,9 @@ export default function AuthWebScreen() {
           throw logoutError;
         }
 
-        window.history.replaceState(
-          {},
-          '',
-          window.location.pathname
-        );
+        if (Platform.OS === 'web') {
+          window.history.replaceState({}, '', window.location.pathname);
+        }
 
         setNewPassword('');
         setConfirmNewPassword('');
@@ -349,7 +332,7 @@ export default function AuthWebScreen() {
           type: 'signup',
           email: emailClean(email),
           options: {
-            emailRedirectTo: window.location.origin,
+            emailRedirectTo: authRedirectUrl(),
           },
         });
 
@@ -372,7 +355,7 @@ export default function AuthWebScreen() {
   const titles = {
     signin: 'Seu dinheiro,\ndo seu jeito.',
     signup: 'Criar minha conta',
-    verify: 'Confirmar meu e-mail',
+    pending: 'Confira seu e-mail',
     forgot: 'Recuperar senha',
     reset: 'Cadastrar nova senha',
   };
@@ -382,8 +365,8 @@ export default function AuthWebScreen() {
       'Entre usando sua conta cadastrada no Meu Financeiro.',
     signup:
       'Use um e-mail que você realmente consegue acessar.',
-    verify:
-      'Digite o código enviado ao e-mail ou abra o link de confirmação recebido.',
+    pending:
+      'Enviamos um link de confirmação para seu endereço. Abra o e-mail e toque em Confirmar. Depois disso, o Meu Financeiro abrirá seu painel automaticamente.',
     forgot:
       'Enviaremos um link para redefinir sua senha.',
     reset:
@@ -441,6 +424,7 @@ export default function AuthWebScreen() {
                 onChangeText={setEmail}
                 keyboardType="email-address"
                 autoCapitalize="none"
+                editable={mode !== 'pending'}
                 placeholder="voce@email.com"
               />
             )}
@@ -465,15 +449,11 @@ export default function AuthWebScreen() {
               />
             )}
 
-            {mode === 'verify' && (
-              <Input
-                label="Código de confirmação"
-                value={code}
-                onChangeText={setCode}
-                keyboardType="number-pad"
-                maxLength={8}
-                placeholder="000000"
-              />
+            {mode === 'pending' && (
+              <Text style={styles.subtitle}>
+                Se não encontrar o link, verifique também a pasta de spam.
+                Se este e-mail já tiver uma conta, use a opção de entrar.
+              </Text>
             )}
 
             {mode === 'reset' && (
@@ -495,23 +475,23 @@ export default function AuthWebScreen() {
               </>
             )}
 
-            <Action
-              disabled={busy}
-              title={
-                busy
-                  ? 'Aguarde…'
-                  : mode === 'signin'
-                    ? 'Entrar no meu painel'
-                    : mode === 'signup'
-                      ? 'Criar minha conta'
-                      : mode === 'verify'
-                        ? 'Confirmar e entrar'
+            {mode !== 'pending' && (
+              <Action
+                disabled={busy}
+                title={
+                  busy
+                    ? 'Aguarde…'
+                    : mode === 'signin'
+                      ? 'Entrar no meu painel'
+                      : mode === 'signup'
+                        ? 'Criar minha conta'
                         : mode === 'forgot'
                           ? 'Enviar link de recuperação'
                           : 'Salvar nova senha'
-              }
-              onPress={runRequest}
-            />
+                }
+                onPress={runRequest}
+              />
+            )}
 
             {busy && (
               <ActivityIndicator color="#356D17" />
@@ -531,7 +511,7 @@ export default function AuthWebScreen() {
               </>
             )}
 
-            {mode === 'verify' && (
+            {mode === 'pending' && (
               <Link
                 title="Reenviar e-mail de confirmação"
                 disabled={busy}
@@ -540,7 +520,7 @@ export default function AuthWebScreen() {
             )}
 
             {(mode === 'signup' ||
-              mode === 'verify' ||
+              mode === 'pending' ||
               mode === 'forgot') && (
               <Link
                 title="Já tenho uma conta: entrar"
